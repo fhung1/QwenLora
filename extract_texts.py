@@ -112,9 +112,12 @@ def main() -> None:
 
         def flush_burst():
             if burst_parts:
+                # Keep as a list, not "\n".join(...): a message can contain a
+                # real typed newline, and joining would make that indistinguishable
+                # from the boundary between two separate messages in the burst.
                 records.append({
                     "date": apple_date_to_iso(burst_start_date),
-                    "text": "\n".join(burst_parts),
+                    "messages": list(burst_parts),
                 })
             burst_parts.clear()
 

@@ -1,5 +1,6 @@
 # Personal data -- never commit
 sent_texts.jsonl
+dropped_messages_review.jsonl
 
 # Python
 __pycache__/
