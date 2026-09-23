@@ -1,0 +1,17 @@
+# Personal data -- never commit
+sent_texts.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Model checkpoints / large artifacts
+*.pt
+*.safetensors
+checkpoints/
+
+# Editor
+.vscode/
+.DS_Store
