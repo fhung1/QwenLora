@@ -2,16 +2,29 @@
 Phase 0 reward function for the Qwen humanization LoRA.
 
 Pure functions over generated text, each independently testable before any
-model touches PPO. Combined into one weighted reward at the bottom.
+model touches training. Combined into one weighted reward at the bottom.
 
 Scope decided 2026-09-23: word count is a soft factor (a target range, not
 an exact match), banned-phrase and perplexity/burstiness are kept, style-
 similarity is scored against sent_texts.jsonl.
+
+Reviewed and fixed 2026-09-27:
+- sentence_perplexities/burstiness only ever split on '.', '!', '?' --  most
+  of this corpus is unpunctuated texting, so real completions almost always
+  hit the < 2 units fallback and silently got a constant default reward.
+  _split_units now falls back through newline boundaries, then sentences,
+  then fixed-size word chunks, so burstiness is measurable on real data.
+- target_perplexity was a hardcoded guess (40.0); calibrate_target_perplexity
+  measures it from the actual corpus instead.
+- perplexity and style-similarity scoring were unbatched (one forward pass
+  per completion) despite GRPO scoring num_generations completions per step;
+  both are now batched in make_grpo_reward_func.
 """
 
 from __future__ import annotations
 
 import json
+import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,49 +83,139 @@ def banned_phrase_score(text: str) -> float:
 # Perplexity / burstiness
 # ---------------------------------------------------------------------------
 
+MIN_PREDICTED_TOKENS = 4  # below this, per-unit perplexity is unreliable -- see batch_perplexities
+
+
+def _split_units(text: str, chunk_words: int = 5) -> list[str]:
+    """Split text into sub-units for per-unit perplexity. Falls back through
+    three levels since most of this corpus has no terminal punctuation:
+    1. newline boundaries (real message boundaries within a burst)
+    2. sentence punctuation within each line
+    3. fixed-size word chunks, for a single unpunctuated run of text
+    Stops at the first level that yields >= 2 units."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    units = []
+    for line in lines:
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", line) if s.strip()]
+        units.extend(sentences)
+    if len(units) >= 2:
+        return units
+
+    words = text.split()
+    if len(words) < 2:
+        return [text] if text.strip() else []
+    chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)]
+    return [c for c in chunks if c.strip()]
+
+
 @dataclass
 class ReferenceLM:
     """Wraps a frozen LM used only for scoring, not training. Intended to be
-    the base Qwen3-1.7B with its LoRA adapter disabled (peft's adapter-
-    disable trick) so this doesn't need a second model copy."""
+    a dedicated frozen copy of the base model, separate from the policy
+    GRPOTrainer trains -- see train_grpo.py for why."""
     model: AutoModelForCausalLM
     tokenizer: AutoTokenizer
     device: str = "mps"
 
     @torch.no_grad()
     def sentence_perplexities(self, text: str) -> list[float]:
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-        perplexities = []
-        for sent in sentences:
-            ids = self.tokenizer(sent, return_tensors="pt").input_ids.to(self.device)
-            if ids.shape[1] < 2:
-                continue
-            out = self.model(ids, labels=ids)
-            perplexities.append(torch.exp(out.loss).item())
-        return perplexities
+        """Single-text path, used by compute_reward() for manual/smoke testing.
+        For batched scoring during training, use batch_perplexities instead."""
+        return self.batch_perplexities([text])[0]
+
+    @torch.no_grad()
+    def batch_perplexities(self, texts: list[str], max_batch_units: int = 32) -> list[list[float]]:
+        """Per-text list of unit-level perplexities. Processes all_units in
+        sub-batches of max_batch_units -- a single forward pass over hundreds
+        of units at once was hitting MPS's 16GB budget (the cross-entropy
+        reshape over [N*T, vocab_size] with a ~152k vocab gets large fast)."""
+        all_units: list[str] = []
+        owner: list[int] = []
+        for i, text in enumerate(texts):
+            units = _split_units(text)
+            all_units.extend(units)
+            owner.extend([i] * len(units))
+
+        result: list[list[float]] = [[] for _ in texts]
+        if not all_units:
+            return result
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+        for start in range(0, len(all_units), max_batch_units):
+            batch_units = all_units[start:start + max_batch_units]
+            batch_owner = owner[start:start + max_batch_units]
+
+            enc = self.tokenizer(
+                batch_units, return_tensors="pt", padding=True, truncation=True, max_length=64
+            ).to(self.device)
+            out = self.model(**enc)
+
+            shift_logits = out.logits[:, :-1, :]
+            shift_labels = enc.input_ids[:, 1:]
+            shift_mask = enc.attention_mask[:, 1:].float()
+
+            losses = loss_fct(
+                shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1)
+            ).view(shift_labels.size())
+
+            real_token_counts = shift_mask.sum(dim=1)
+            seq_loss = (losses * shift_mask).sum(dim=1) / real_token_counts.clamp(min=1)
+            seq_ppl = torch.exp(seq_loss).tolist()
+
+            # Sequences under MIN_PREDICTED_TOKENS give degenerate perplexity --
+            # confirmed empirically: a 2-token unit (1 prediction, no BOS, zero
+            # context at position 0) scored in the millions across every phrase
+            # tested, vs. sane values (~150-250) once there's real context. Units
+            # this short are common in this corpus (e.g. a whole 2-word message),
+            # so they're dropped here rather than silently corrupting the mean.
+            for count, ppl, o in zip(real_token_counts.tolist(), seq_ppl, batch_owner):
+                if count >= MIN_PREDICTED_TOKENS:
+                    result[o].append(ppl)
+
+        return result
 
 
-def perplexity_burstiness_score(
-    text: str, ref_lm: ReferenceLM, target_perplexity: float = 40.0
-) -> tuple[float, float]:
-    """Returns (perplexity_score, burstiness_score), each in [0, 1].
-    perplexity_score peaks at target_perplexity (too low reads as robotic/
-    predictable, too high reads as incoherent). burstiness_score rewards
-    variance in per-sentence perplexity (human-typical) over uniformity
-    (AI-typical)."""
-    ppls = ref_lm.sentence_perplexities(text)
+def calibrate_target_perplexity(ref_lm: ReferenceLM, sample_size: int = 200) -> float:
+    """Measures typical perplexity of the reference corpus under ref_lm, to
+    use as target_perplexity instead of a hardcoded guess. Uses the median,
+    not the mean -- real text has a heavy right tail (rare names, slang,
+    emoji genuinely score high perplexity; this isn't a bug, but a handful
+    of such units dragged the mean to ~10x the median in testing)."""
+    with SENT_TEXTS_PATH.open(encoding="utf-8") as f:
+        lines = f.readlines()
+    random.seed(0)
+    sample_lines = random.sample(lines, min(sample_size, len(lines)))
+    texts = ["\n".join(json.loads(line)["messages"]) for line in sample_lines]
+
+    per_text_ppls = ref_lm.batch_perplexities(texts)
+    all_ppls = sorted(p for ppls in per_text_ppls for p in ppls)
+    if not all_ppls:
+        return 40.0
+    return all_ppls[len(all_ppls) // 2]
+
+
+def _score_perplexity_burstiness(ppls: list[float], target_perplexity: float) -> tuple[float, float]:
     if len(ppls) < 2:
-        return 0.5, 0.0  # not enough sentences to judge either signal
+        return 0.5, 0.0  # not enough units to judge either signal
 
     mean_ppl = sum(ppls) / len(ppls)
     perplexity_score = max(0.0, 1.0 - abs(mean_ppl - target_perplexity) / target_perplexity)
 
     variance = sum((p - mean_ppl) ** 2 for p in ppls) / len(ppls)
     std = variance ** 0.5
-    # Normalize burstiness by mean so it's scale-free; squash to [0, 1].
     burstiness_score = min(1.0, (std / mean_ppl) if mean_ppl > 0 else 0.0)
 
     return perplexity_score, burstiness_score
+
+
+def perplexity_burstiness_score(
+    text: str, ref_lm: ReferenceLM, target_perplexity: float = 40.0
+) -> tuple[float, float]:
+    """Single-text path for compute_reward()/manual testing. Returns
+    (perplexity_score, burstiness_score), each in [0, 1]."""
+    return _score_perplexity_burstiness(ref_lm.sentence_perplexities(text), target_perplexity)
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +237,13 @@ class StyleReference:
         self.centroid = embeddings.mean(dim=0)
 
     def similarity_score(self, text: str) -> float:
-        emb = self.embedder.encode(text, convert_to_tensor=True)
-        return util.cos_sim(emb, self.centroid).item()
+        """Single-text path for compute_reward()/manual testing."""
+        return self.similarity_scores([text])[0]
+
+    def similarity_scores(self, texts: list[str]) -> list[float]:
+        """Batched path, used by make_grpo_reward_func."""
+        embs = self.embedder.encode(texts, convert_to_tensor=True)
+        return util.cos_sim(embs, self.centroid.unsqueeze(0)).squeeze(1).tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +259,23 @@ WEIGHTS = {
 }
 
 
+def _weighted_total(components: dict[str, float]) -> float:
+    return sum(WEIGHTS[k] * v for k, v in components.items())
+
+
 def compute_reward(
     text: str,
     target_word_count: int,
     ref_lm: ReferenceLM,
     style_ref: StyleReference,
+    target_perplexity: float = 40.0,
 ) -> dict[str, float]:
+    """Single-text path -- for manual testing (e.g. via QwenLora.py) or the
+    smoke test below. make_grpo_reward_func uses its own batched path for
+    actual training, not this function, to avoid per-completion model calls."""
     wc = word_count_score(text, target_word_count)
     bp = banned_phrase_score(text)
-    ppl, burst = perplexity_burstiness_score(text, ref_lm)
+    ppl, burst = perplexity_burstiness_score(text, ref_lm, target_perplexity)
     sim = style_ref.similarity_score(text)
 
     components = {
@@ -169,20 +285,44 @@ def compute_reward(
         "burstiness": burst,
         "style_similarity": sim,
     }
-    total = sum(WEIGHTS[k] * v for k, v in components.items())
-    return {**components, "total": total}
+    return {**components, "total": _weighted_total(components)}
 
 
-def make_grpo_reward_func(ref_lm: ReferenceLM, style_ref: StyleReference):
+def make_grpo_reward_func(
+    ref_lm: ReferenceLM, style_ref: StyleReference, target_perplexity: float | None = None
+):
     """Returns a reward function matching TRL's GRPOTrainer signature:
     (prompts, completions, **dataset_columns) -> list[float]. `target_word_count`
-    arrives as a kwarg automatically since it's a column in prompts.jsonl."""
+    arrives as a kwarg automatically since it's a column in prompts.jsonl.
+
+    Batches the two model-backed components (perplexity/burstiness, style-
+    similarity) across the whole group of completions in one call each,
+    rather than one forward pass per completion -- matters at GRPO's
+    num_generations throughput."""
+    if target_perplexity is None:
+        target_perplexity = calibrate_target_perplexity(ref_lm)
+        print(f"Calibrated target_perplexity from corpus: {target_perplexity:.2f}")
 
     def reward_func(prompts, completions, target_word_count, **kwargs) -> list[float]:
+        wc_scores = [word_count_score(c, t) for c, t in zip(completions, target_word_count)]
+        bp_scores = [banned_phrase_score(c) for c in completions]
+
+        per_completion_ppls = ref_lm.batch_perplexities(completions)
+        ppl_burst = [_score_perplexity_burstiness(p, target_perplexity) for p in per_completion_ppls]
+        ppl_scores = [pb[0] for pb in ppl_burst]
+        burst_scores = [pb[1] for pb in ppl_burst]
+
+        sim_scores = style_ref.similarity_scores(completions)
+
         rewards = []
-        for completion, target in zip(completions, target_word_count):
-            result = compute_reward(completion, target, ref_lm, style_ref)
-            rewards.append(result["total"])
+        for wc, bp, ppl, burst, sim in zip(wc_scores, bp_scores, ppl_scores, burst_scores, sim_scores):
+            rewards.append(_weighted_total({
+                "word_count": wc,
+                "banned_phrase": bp,
+                "perplexity": ppl,
+                "burstiness": burst,
+                "style_similarity": sim,
+            }))
         return rewards
 
     return reward_func
@@ -194,3 +334,8 @@ if __name__ == "__main__":
     print("word_count_score(target=15):", word_count_score(sample, target=15))
     print("banned_phrase_score:", banned_phrase_score(sample))
     print("banned_phrase_score (with em-dash):", banned_phrase_score(sample + " — no wait"))
+    print()
+    print("_split_units on unpunctuated single-line text (the real-world case):")
+    print(" ", _split_units("yeah i can do 3pm actually can we push to 4 something came up"))
+    print("_split_units on a multi-line burst:")
+    print(" ", _split_units("wait actually\nnvm i figured it out\nall good now"))
