@@ -8,6 +8,12 @@ Commands (type alone on a line to switch mode):
   /base   -- generate from the base model only
   /lora   -- generate from the LoRA-adapted model only (if a checkpoint exists)
   /both   -- generate from both, side by side (default once a checkpoint exists)
+  /raw    -- raw continuation format: your text is fed straight to the model,
+             no chat template. This is the format build_prompts.py/GRPO
+             actually trained on -- default, since that's the fair comparison.
+  /chat   -- wraps your text in Qwen's chat template (role: user) instead.
+             Useful for testing general conversational ability, but NOT
+             representative of what the LoRA was trained on.
   quit / exit -- stop
 """
 
@@ -17,6 +23,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"
 ADAPTER_PATH = Path(__file__).parent / "checkpoints" / "lora_adapter"
+# Check for the actual adapter file, not just directory existence -- GRPOConfig's
+# output_dir gets created as a side effect before training ever saves anything,
+# so an empty directory here doesn't mean a real adapter exists.
+ADAPTER_CONFIG_PATH = ADAPTER_PATH / "adapter_config.json"
 
 print(f"Loading {MODEL_NAME}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -25,7 +35,7 @@ base_model.eval()
 
 model = base_model
 has_lora = False
-if ADAPTER_PATH.exists():
+if ADAPTER_CONFIG_PATH.exists():
     from peft import PeftModel
     print(f"Found LoRA adapter at {ADAPTER_PATH}, loading...")
     model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
@@ -36,15 +46,19 @@ else:
     print(f"No LoRA adapter found at {ADAPTER_PATH} -- base model only for now.")
 
 mode = "both" if has_lora else "base"
-print(f"Ready (mode: {mode}). Type a prompt, or 'quit' to exit.\n")
+fmt = "raw"  # matches build_prompts.py's training format -- see /chat to override
+print(f"Ready (mode: {mode}, format: {fmt}). Type a prompt, or 'quit' to exit.\n")
 
 
 def generate(prompt: str, max_new_tokens: int = 200, temperature: float = 0.8) -> str:
-    messages = [{"role": "user", "content": prompt}]
-    # enable_thinking=False -- we want direct output, not Qwen3's chain-of-thought trace.
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-    )
+    if fmt == "chat":
+        messages = [{"role": "user", "content": prompt}]
+        # enable_thinking=False -- we want direct output, not Qwen3's chain-of-thought trace.
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+    else:
+        text = prompt  # raw continuation -- no chat structure, matches training
     inputs = tokenizer(text, return_tensors="pt").to("mps")
     output_ids = model.generate(
         **inputs,
@@ -82,6 +96,10 @@ if __name__ == "__main__":
                 continue
             mode = requested
             print(f"Mode set to: {mode}\n")
+            continue
+        if line.lower() in ("/raw", "/chat"):
+            fmt = line.lower()[1:]
+            print(f"Format set to: {fmt}\n")
             continue
 
         if mode == "base":

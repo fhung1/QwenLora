@@ -44,6 +44,18 @@ reward_func = make_grpo_reward_func(ref_lm, style_ref)
 print(f"Loading prompts from {PROMPTS_PATH}...")
 dataset = load_dataset("json", data_files=str(PROMPTS_PATH), split="train")
 
+print("Loading policy model...")
+# Load and place explicitly, rather than passing MODEL_NAME as a string to
+# GRPOTrainer and letting accelerate handle it -- with two 1.7B model copies
+# in the same process, accelerate was falling back to meta-device lazy
+# loading for this one, which then crashed trying to materialize it onto MPS
+# ("Cannot copy out of meta tensor; no data!"). low_cpu_mem_usage=False
+# forces real, immediate allocation instead of the meta-device placeholder path.
+policy_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+policy_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, torch_dtype="auto", low_cpu_mem_usage=False
+).to("mps")
+
 peft_config = LoraConfig(
     r=16,
     lora_alpha=32,
@@ -56,16 +68,26 @@ peft_config = LoraConfig(
 training_args = GRPOConfig(
     output_dir=str(OUTPUT_DIR),
     per_device_train_batch_size=4,
-    num_generations=8,       # group size GRPO compares within, per prompt
-    max_completion_length=128,
+    num_generations=4,       # group size GRPO compares within, per prompt --
+                              # must evenly divide generation_batch_size (which
+                              # defaults to per_device_train_batch_size); lowered
+                              # from 8 rather than raising batch size, to keep
+                              # memory down on 16GB unified memory
+    max_completion_length=48,  # prompts.jsonl's target_word_count: p50=6,
+                              # p75=10, p90=13, p99=25 words. 32 (used for the
+                              # POC run) left completions/clipped_ratio at 1.0
+                              # across all 5 steps -- nothing ever finished
+                              # naturally. 48 tokens covers p99 with headroom
+                              # for an EOS token, without 128's excess.
     learning_rate=1e-4,
-    num_train_epochs=1,      # start small -- Phase 1-style sanity run first
-    logging_steps=5,
-    save_steps=50,
+    max_steps=5,              # proof-of-concept: does it run at all, end to end
+    logging_steps=1,
+    save_steps=5,
 )
 
 trainer = GRPOTrainer(
-    model=MODEL_NAME,
+    model=policy_model,
+    processing_class=policy_tokenizer,
     peft_config=peft_config,
     args=training_args,
     reward_funcs=reward_func,

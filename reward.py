@@ -24,6 +24,7 @@ Reviewed and fixed 2026-09-27:
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 from dataclasses import dataclass, field
@@ -55,14 +56,21 @@ BANNED_PHRASES = [
 # Word count (soft)
 # ---------------------------------------------------------------------------
 
-def word_count_score(text: str, target: int, tolerance: float = 0.3) -> float:
-    """1.0 at the target length, decaying linearly to 0.0 at `tolerance`
-    fraction away (e.g. tolerance=0.3 means +/-30% of target scores 0)."""
+def word_count_score(text: str, target: int, tolerance: float = 0.3, min_sigma: float = 2.0) -> float:
+    """Gaussian/MSE-based score: 1.0 at the target length, smoothly decaying
+    with no hard cutoff. sigma = max(target * tolerance, min_sigma) -- the
+    floor matters for short targets: the original linear version used a pure
+    fractional tolerance, so for target=3 (17.9% of this corpus), 30% of 3 is
+    under 1 word, making even n=2 or n=4 score exactly 0 -- effectively an
+    exact-match requirement, the opposite of the "soft factor" it was meant
+    to be. min_sigma guarantees a real decay curve regardless of how short
+    the target is, while tolerance still dominates for longer targets."""
     n = len(text.split())
     if target <= 0:
         return 1.0
-    frac_off = abs(n - target) / target
-    return max(0.0, 1.0 - frac_off / tolerance)
+    sigma = max(target * tolerance, min_sigma)
+    mse = (n - target) ** 2
+    return math.exp(-mse / (2 * sigma ** 2))
 
 
 # ---------------------------------------------------------------------------
@@ -197,11 +205,21 @@ def calibrate_target_perplexity(ref_lm: ReferenceLM, sample_size: int = 200) -> 
 
 
 def _score_perplexity_burstiness(ppls: list[float], target_perplexity: float) -> tuple[float, float]:
-    if len(ppls) < 2:
-        return 0.5, 0.0  # not enough units to judge either signal
+    """Perplexity and burstiness are decoupled: perplexity only needs one
+    valid unit (a mean over however many exist), but burstiness genuinely
+    needs >= 2 to measure variance at all. 44.3% of this corpus's targets
+    are <= 5 words, where _split_units often returns exactly one whole-text
+    unit -- treating that as "no signal" for perplexity too (the original
+    behavior) was throwing away a perfectly good score on nearly half the
+    data, not a real data limitation like the burstiness case is."""
+    if len(ppls) == 0:
+        return 0.5, 0.0  # nothing to measure at all
 
     mean_ppl = sum(ppls) / len(ppls)
     perplexity_score = max(0.0, 1.0 - abs(mean_ppl - target_perplexity) / target_perplexity)
+
+    if len(ppls) < 2:
+        return perplexity_score, 0.0  # real perplexity, but no variance to measure burstiness from
 
     variance = sum((p - mean_ppl) ** 2 for p in ppls) / len(ppls)
     std = variance ** 0.5
