@@ -56,21 +56,21 @@ BANNED_PHRASES = [
 # Word count (soft)
 # ---------------------------------------------------------------------------
 
-def word_count_score(text: str, target: int, tolerance: float = 0.3, min_sigma: float = 2.0) -> float:
-    """Gaussian/MSE-based score: 1.0 at the target length, smoothly decaying
-    with no hard cutoff. sigma = max(target * tolerance, min_sigma) -- the
-    floor matters for short targets: the original linear version used a pure
-    fractional tolerance, so for target=3 (17.9% of this corpus), 30% of 3 is
-    under 1 word, making even n=2 or n=4 score exactly 0 -- effectively an
-    exact-match requirement, the opposite of the "soft factor" it was meant
-    to be. min_sigma guarantees a real decay curve regardless of how short
-    the target is, while tolerance still dominates for longer targets."""
+def word_count_score(text: str, target: int) -> float:
+    """Log-ratio score: 1.0 when n == target, smoothly decaying with no hard
+    cutoff. Scale-invariant by construction -- error is measured as
+    log(n/target), so a given *proportional* miss (e.g. 2x too long) scores
+    the same regardless of whether target is 3 or 30. This replaces two
+    earlier versions that both needed an ad hoc floor to avoid collapsing to
+    a near-exact-match requirement for short targets (e.g. target=3, 17.9%
+    of this corpus) -- log-ratio doesn't have that failure mode at all."""
     n = len(text.split())
+    if n == 0:
+        return 0.0
     if target <= 0:
         return 1.0
-    sigma = max(target * tolerance, min_sigma)
-    mse = (n - target) ** 2
-    return math.exp(-mse / (2 * sigma ** 2))
+    error = math.log(n / target)
+    return 1.0 / (1.0 + (error / 0.75) ** 2)
 
 
 # ---------------------------------------------------------------------------
