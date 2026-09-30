@@ -24,7 +24,6 @@ print(f"Loading prompts from {PROMPTS_PATH}...")
 dataset = load_dataset("json", data_files=str(PROMPTS_PATH), split="train")
 
 print("Loading policy model...")
-# Avoid meta-device loading when both model copies share MPS.
 policy_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 policy_model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME, torch_dtype="auto", low_cpu_mem_usage=False
@@ -42,10 +41,20 @@ peft_config = LoraConfig(
 training_args = GRPOConfig(
     output_dir=str(OUTPUT_DIR),
     per_device_train_batch_size=4,
-    num_generations=4,  # Matches the batch size.
-    max_completion_length=48,  # Prior 32-token run clipped every completion.
+    num_generations=4,
+    max_completion_length=48,  # 512 was tested (2026-09-30): 100% of
+                                # completions hit the cap with zero natural
+                                # EOS terminations even with that much room --
+                                # the base model doesn't know to stop on raw
+                                # continuation prompts, so a larger cap just
+                                # wastes compute (~150-200s/step) rather than
+                                # letting EOS decide. 48 matches the real
+                                # target_word_count distribution (p99=25
+                                # words); GRPO's word_count reward is what
+                                # should teach stopping behavior over many
+                                # real training steps, not generation headroom.
     learning_rate=1e-4,
-    max_steps=5,  # End-to-end smoke run.
+    max_steps=5,
     logging_steps=1,
     save_steps=5,
 )
