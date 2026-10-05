@@ -17,12 +17,13 @@ Commands (type alone on a line to switch mode):
   quit / exit -- stop
 """
 
+import os
 from pathlib import Path
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"
-ADAPTER_PATH = Path(__file__).parent / "checkpoints" / "lora_adapter"
+ADAPTER_PATH = Path(__file__).parent / "checkpoints" / os.environ.get("QWEN_ADAPTER", "lora_adapter")
 # Check for the actual adapter file, not just directory existence -- GRPOConfig's
 # output_dir gets created as a side effect before training ever saves anything,
 # so an empty directory here doesn't mean a real adapter exists.

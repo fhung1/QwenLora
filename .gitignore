@@ -2,6 +2,7 @@
 sent_texts.jsonl
 dropped_messages_review.jsonl
 prompts.jsonl
+sft_pairs.jsonl
 
 # Python
 __pycache__/
