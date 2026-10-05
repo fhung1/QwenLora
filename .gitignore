@@ -18,3 +18,4 @@ checkpoints/
 # Editor
 .vscode/
 .DS_Store
+reply_sft_pairs.jsonl

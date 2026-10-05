@@ -1,12 +1,6 @@
-"""
-Extract sent iMessage/SMS text into a JSONL reference corpus for the Qwen
-LoRA style-similarity reward (Phase 0).
+"""Extract sent Messages text to JSONL. Requires Full Disk Access."""
 
-Requires Full Disk Access for the terminal/IDE running this script:
-System Settings -> Privacy & Security -> Full Disk Access.
-"""
-
-from __future__ import annotations  # `bytes | None` hints on macOS's Python 3.9
+from __future__ import annotations
 
 import json
 import shutil
@@ -18,16 +12,14 @@ from pathlib import Path
 DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 OUT_PATH = Path(__file__).parent / "sent_texts.jsonl"
 
-MAC_EPOCH_OFFSET = 978307200  # seconds between 1970-01-01 and 2001-01-01
-OBJ_REPLACEMENT = "￼"  # inline placeholder where an attachment sat
-BURST_GAP_SECONDS = 5 * 60  # gap after which a new burst starts even with no reply
-MAX_MESSAGE_CHARS = 500  # drops pasted documents/essays, not real texting
+MAC_EPOCH_OFFSET = 978307200  # Unix to Apple epoch offset.
+OBJ_REPLACEMENT = "￼"  # Attachment placeholder.
+BURST_GAP_SECONDS = 5 * 60
+MAX_MESSAGE_CHARS = 500
 
 
 def decode_attributed_body(blob: bytes | None) -> str | None:
-    """attributedBody is a typedstream blob: after the NSString class name and
-    5 header bytes comes a length (1 byte, or 0x81+u16, or 0x82+u32), then
-    that many bytes of UTF-8 text."""
+    """Read UTF-8 text from a Messages attributedBody blob."""
     if not blob:
         return None
     idx = blob.find(b"NSString")
@@ -50,7 +42,7 @@ def decode_attributed_body(blob: bytes | None) -> str | None:
 def apple_date_to_secs(raw: int | None) -> float | None:
     if not raw:
         return None
-    # Newer DBs store nanoseconds since 2001; older ones store seconds.
+    # Recent databases use nanoseconds; older ones use seconds.
     return (raw / 1e9 if raw > 1e11 else raw) + MAC_EPOCH_OFFSET
 
 
@@ -112,9 +104,7 @@ def main() -> None:
 
         def flush_burst():
             if burst_parts:
-                # Keep as a list, not "\n".join(...): a message can contain a
-                # real typed newline, and joining would make that indistinguishable
-                # from the boundary between two separate messages in the burst.
+                # Preserve message boundaries separately from typed newlines.
                 records.append({
                     "date": apple_date_to_iso(burst_start_date),
                     "messages": list(burst_parts),
@@ -131,11 +121,11 @@ def main() -> None:
             is_content = row["associated_message_type"] == 0 and row["item_type"] == 0
 
             if row["is_from_me"] == 0:
-                if is_content:  # a real incoming message breaks the burst; their tapbacks don't
+                if is_content:  # Incoming messages break bursts.
                     flush_burst()
                 continue
 
-            if not is_content:  # your own tapbacks/system rows: no new content, no break
+            if not is_content:  # Skip tapbacks and system rows.
                 continue
 
             text = resolve_text(row, failed_decodes)

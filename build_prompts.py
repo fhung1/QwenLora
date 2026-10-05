@@ -1,25 +1,4 @@
-"""
-Build PPO training prompts from sent_texts.jsonl using continuation framing:
-split each burst into a prompt and a target continuation, both joined with
-"\n" regardless of whether a line break was a real send-boundary or an
-in-message newline -- that distinction only matters in the stored source of
-truth (sent_texts.jsonl), not in the disposable strings fed to the model.
-
-Split point targets ~35% of the burst's own word count (a proxy for token
-count -- no tokenizer dependency, consistent with word_count_score elsewhere),
-clamped to hard floors on both sides: a prompt has to carry enough words to
-be a real conditioning signal, and a continuation has to leave something
-worth generating. The cut is made on the flat word stream across all of a
-burst's messages, so it naturally lands on a real message boundary (a "\n"
-in the output) whenever the word-count math allows it, and only splits a
-single message mid-word when a message straddles the cut point -- no
-separate boundary-snapping logic needed.
-
-Bursts too short to clear both floors are skipped -- they still feed the
-style centroid in reward.py, just not this prompt pool.
-
-Output: prompts.jsonl, one {"prompt", "target_word_count"} object per line.
-"""
+"""Split sent-message bursts into continuation prompts and target word counts."""
 
 import json
 from pathlib import Path

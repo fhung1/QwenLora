@@ -42,17 +42,7 @@ training_args = GRPOConfig(
     output_dir=str(OUTPUT_DIR),
     per_device_train_batch_size=4,
     num_generations=4,
-    max_completion_length=48,  # 512 was tested (2026-09-30): 100% of
-                                # completions hit the cap with zero natural
-                                # EOS terminations even with that much room --
-                                # the base model doesn't know to stop on raw
-                                # continuation prompts, so a larger cap just
-                                # wastes compute (~150-200s/step) rather than
-                                # letting EOS decide. 48 matches the real
-                                # target_word_count distribution (p99=25
-                                # words); GRPO's word_count reward is what
-                                # should teach stopping behavior over many
-                                # real training steps, not generation headroom.
+    max_completion_length=48,  # A 512-token test never reached EOS.
     learning_rate=1e-4,
     max_steps=5,
     logging_steps=1,

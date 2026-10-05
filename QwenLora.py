@@ -1,20 +1,6 @@
-"""
-Interactive prompt loop for Qwen3-1.7B -- lets you compare the base model
-against the trained LoRA adapter (once Phase 2 produces one), without
-loading two separate copies of the weights. Uses peft's adapter-disable
-trick: one model object, adapter toggled on/off per generation call.
+"""Compare base and LoRA outputs from one Qwen3-1.7B model.
 
-Commands (type alone on a line to switch mode):
-  /base   -- generate from the base model only
-  /lora   -- generate from the LoRA-adapted model only (if a checkpoint exists)
-  /both   -- generate from both, side by side (default once a checkpoint exists)
-  /raw    -- raw continuation format: your text is fed straight to the model,
-             no chat template. This is the format build_prompts.py/GRPO
-             actually trained on -- default, since that's the fair comparison.
-  /chat   -- wraps your text in Qwen's chat template (role: user) instead.
-             Useful for testing general conversational ability, but NOT
-             representative of what the LoRA was trained on.
-  quit / exit -- stop
+Commands: /base, /lora, /both; /raw (training format), /chat; quit/exit.
 """
 
 import os
@@ -24,9 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"
 ADAPTER_PATH = Path(__file__).parent / "checkpoints" / os.environ.get("QWEN_ADAPTER", "lora_adapter")
-# Check for the actual adapter file, not just directory existence -- GRPOConfig's
-# output_dir gets created as a side effect before training ever saves anything,
-# so an empty directory here doesn't mean a real adapter exists.
+# The output directory can exist before an adapter is saved.
 ADAPTER_CONFIG_PATH = ADAPTER_PATH / "adapter_config.json"
 
 print(f"Loading {MODEL_NAME}...")
@@ -47,19 +31,18 @@ else:
     print(f"No LoRA adapter found at {ADAPTER_PATH} -- base model only for now.")
 
 mode = "both" if has_lora else "base"
-fmt = "raw"  # matches build_prompts.py's training format -- see /chat to override
+fmt = "raw"  # Training format.
 print(f"Ready (mode: {mode}, format: {fmt}). Type a prompt, or 'quit' to exit.\n")
 
 
 def generate(prompt: str, max_new_tokens: int = 200, temperature: float = 0.8) -> str:
     if fmt == "chat":
         messages = [{"role": "user", "content": prompt}]
-        # enable_thinking=False -- we want direct output, not Qwen3's chain-of-thought trace.
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
     else:
-        text = prompt  # raw continuation -- no chat structure, matches training
+        text = prompt
     inputs = tokenizer(text, return_tensors="pt").to("mps")
     output_ids = model.generate(
         **inputs,
@@ -80,7 +63,7 @@ def generate_base(prompt: str) -> str:
 
 
 def generate_lora(prompt: str) -> str:
-    return generate(prompt)  # adapter is enabled by default once loaded
+    return generate(prompt)
 
 
 if __name__ == "__main__":
